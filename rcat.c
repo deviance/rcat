@@ -87,12 +87,13 @@ void rwloop(int sockfd, const char *ifname, const char *dest_mac)
 	make_lladdr(dest_mac, &dest);
 
 	struct my_packet pkt;
-	memcpy(&dest, pkt.hdr.ether_dhost, sizeof(pkt.hdr.ether_dhost));
-	memcpy(&src,  pkt.hdr.ether_shost, sizeof(pkt.hdr.ether_shost));
+	memcpy(pkt.hdr.ether_dhost, dest.sll_addr, sizeof(pkt.hdr.ether_dhost));
+	memcpy(pkt.hdr.ether_shost, src.sll_addr,  sizeof(pkt.hdr.ether_shost));
 	pkt.hdr.ether_type = htons(Tflag);
 
 	fprintf(stderr, "Src: "); print_addr(&src);
 	fprintf(stderr, "Dst: "); print_addr(&dest);
+
 	for (;;) {
 		readfds = master_readfds;
 		timeout = master_timeout;
