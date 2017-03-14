@@ -39,21 +39,6 @@
 #include <sys/select.h>
 #include <linux/if_vlan.h>
 
-char bcastmac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
-
-int make_srcaddr(int sockfd, const char *ifname, struct sockaddr_ll *dest_out);
-int make_lladdr(const char *mac, struct sockaddr_ll *dest_out);
-
-void print_addr(unsigned char mac[6])
-{
-	fprintf(stderr, "%2x:%2x:%2x:%2x:%2x:%2x\n", mac[0],
-		mac[1],
-		mac[2],
-		mac[3],
-		mac[4],
-		mac[5]);
-}
-
 struct my_packet {
 	struct ether_header hdr;
 	unsigned char data[ETHERMTU - sizeof(struct ether_header)];
@@ -62,15 +47,20 @@ struct my_packet {
 int split_hwaddr(const char *macstr, unsigned char hwaddr[6]);
 int get_iface_hwaddr(int sockfd, const char *iface, unsigned char hwaddr[6]);
 int get_iface_index(int sockfd, const char *iface, int *index);
+void print_addr(unsigned char mac[6]);
 
-void rwloop(int sockfd, const char *ifname, const char *dest_mac, unsigned short proto)
+void rwloop(int sockfd, const char *src, const char *dst, unsigned short proto)
 {
-	char buf[1024];
-	int nread_stdin, nread_netfd, nwritten;
-	struct sockaddr_ll src;
-	struct sockaddr_ll client;
+	char buf[ETHERMTU];
+	int nread_stdin,
+	    nread_netfd,
+	    nwritten;
+	struct sockaddr_ll sll_src;
+	struct sockaddr_ll sll_client;
 	socklen_t clientsz;
-	fd_set master_readfds, readfds, writefds;
+	fd_set master_readfds,
+	       readfds,
+	       writefds;
 	int nready;
 	const struct timeval master_timeout = {
 		.tv_sec = 60,
@@ -86,29 +76,37 @@ void rwloop(int sockfd, const char *ifname, const char *dest_mac, unsigned short
 	FD_SET(STDIN_FILENO, &master_readfds);
 	FD_SET(sockfd, &master_readfds);
 
-	/* Setup a source struct sockaddr_ll */
-	memset(&src, 0, sizeof(src));
-	/* Only interface name must be passed. */
-	if (get_iface_hwaddr(sockfd, ifname, src.sll_addr))
-		return;
+	if (src) {
+		/* Setup a source struct sockaddr_ll */
+		memset(&sll_src, 0, sizeof(sll_src));
+		/* Only interface name must be passed. */
+		if (get_iface_hwaddr(sockfd, src, sll_src.sll_addr))
+			return;
 
-	if (get_iface_index(sockfd, ifname, &src.sll_ifindex))
-		return;
+		fprintf(stderr, "%s hwaddr is ", src); print_addr(sll_src.sll_addr);
 
-	src.sll_family = AF_PACKET;
-	src.sll_protocol = htons(proto);
-	src.sll_halen = ETH_ALEN;
+		if (get_iface_index(sockfd, src, &sll_src.sll_ifindex))
+			return;
 
-	/* Destination may be either an interface name or a hw address. */
-	if (split_hwaddr(dest_mac, pkt.hdr.ether_dhost) &&
-	    get_iface_hwaddr(sockfd, dest_mac, pkt.hdr.ether_dhost))
-		return;
+		fprintf(stderr, "%s index is %d\n", src, sll_src.sll_ifindex);
 
-	memcpy(pkt.hdr.ether_shost, src.sll_addr,  sizeof(pkt.hdr.ether_shost));
-	pkt.hdr.ether_type = htons(proto);
+		sll_src.sll_family = AF_PACKET;
+		sll_src.sll_protocol = htons(proto);
+		sll_src.sll_halen = ETH_ALEN;
+		memcpy(pkt.hdr.ether_shost, sll_src.sll_addr, sizeof(pkt.hdr.ether_shost));
+	}
 
-	fprintf(stderr, "Src: "); print_addr(src.sll_addr);
-	fprintf(stderr, "Dst: "); print_addr(pkt.hdr.ether_dhost);
+	if (dst) {
+		/* Destination may be either an interface name or a hw address. */
+		if (split_hwaddr(dst, pkt.hdr.ether_dhost) &&
+		    get_iface_hwaddr(sockfd, dst, pkt.hdr.ether_dhost))
+			return;
+
+		fprintf(stderr, "%s hwaddr is ", dst); print_addr(pkt.hdr.ether_dhost);
+	}
+
+	if (proto >= 0)
+		pkt.hdr.ether_type = htons(proto);
 
 	for (;;) {
 		readfds = master_readfds;
@@ -129,7 +127,7 @@ void rwloop(int sockfd, const char *ifname, const char *dest_mac, unsigned short
 		if (FD_ISSET(STDIN_FILENO, &readfds)) {
 			nread_stdin = read(STDIN_FILENO, pkt.data, sizeof(pkt.data));
 			if (nread_stdin < 0) {
-				perror("read(STDIN_FILENO)");
+				perror("read: STDIN");
 				break;
 			}
 			/* STDIN_FILENO gone */
@@ -145,9 +143,9 @@ void rwloop(int sockfd, const char *ifname, const char *dest_mac, unsigned short
 
 		if (FD_ISSET(sockfd, &readfds)) {
 			nread_netfd = recvfrom(sockfd, buf, sizeof(buf), 0,
-				(struct sockaddr *) &client, &clientsz);
+				(struct sockaddr *) &sll_client, &clientsz);
 			if (nread_netfd < 0) {
-				perror("recvfrom(sockfd)");
+				perror("recvfrom: sockfd");
 				break;
 			}
 			fprintf(stderr, "sockfd: %db in\n", nread_netfd);
@@ -157,7 +155,7 @@ void rwloop(int sockfd, const char *ifname, const char *dest_mac, unsigned short
 		if (FD_ISSET(STDOUT_FILENO, &writefds)) {
 			nwritten = write(STDOUT_FILENO, buf, nread_netfd);
 			if (nwritten < 0) {
-				perror("write(STDOUT_FILENO)");
+				perror("write: STDOUT");
 				break;
 			}
 			fprintf(stderr, "stdout: %db out\n", nwritten);
@@ -166,9 +164,9 @@ void rwloop(int sockfd, const char *ifname, const char *dest_mac, unsigned short
 
 		if (FD_ISSET(sockfd, &writefds)) {
 			nwritten = sendto(sockfd, &pkt, sizeof(pkt.hdr) + nread_stdin, 0,
-				(struct sockaddr *) &src, sizeof(src));
+				(struct sockaddr *) &sll_src, sizeof(sll_src));
 			if (nwritten < 0) {
-				perror("sendto(sockfd)");
+				perror("sendto: sockfd");
 				break;
 			}
 			fprintf(stderr, "sockfd: %db out\n", nwritten);
@@ -181,6 +179,9 @@ int get_iface_hwaddr(int sockfd, const char *iface, unsigned char hwaddr[6])
 {
 	struct ifreq if_mac;
 
+	if (!iface)
+		return -1;
+
 	memset(&if_mac, 0, sizeof(if_mac));
 	strncpy(if_mac.ifr_name, iface, IFNAMSIZ-1);
 	if (ioctl(sockfd, SIOCGIFHWADDR, &if_mac) < 0) {
@@ -191,6 +192,12 @@ int get_iface_hwaddr(int sockfd, const char *iface, unsigned char hwaddr[6])
 	memcpy(hwaddr, if_mac.ifr_hwaddr.sa_data, 6);
 
 	return 0;
+}
+
+void print_addr(unsigned char mac[6])
+{
+	fprintf(stderr, "%2x:%2x:%2x:%2x:%2x:%2x\n", mac[0], mac[1],
+	        mac[2], mac[3], mac[4], mac[5]);
 }
 
 int get_iface_index(int sockfd, const char *iface, int *index)
@@ -222,25 +229,17 @@ int split_hwaddr(const char *macstr, unsigned char hwaddr[6])
 
 int rawbind(int sockfd, const char *ifname, unsigned short protocol)
 {
-	struct ifreq if_idx;
 	struct sockaddr_ll sockaddr;
 
-	printf("binding to %s\n", ifname);
 	/* Get the index of the interface to send on */
-	memset(&if_idx, 0, sizeof(struct ifreq));
-	strncpy(if_idx.ifr_name, ifname, IFNAMSIZ-1);
-	if (ioctl(sockfd, SIOCGIFINDEX, &if_idx) < 0) {
-		perror("SIOCGIFINDEX");
+	if (get_iface_index(sockfd, ifname, &sockaddr.sll_ifindex))
 		return -1;
-	}
 
 	memset(&sockaddr, 0, sizeof(sockaddr));
 	sockaddr.sll_family = AF_PACKET;
 	sockaddr.sll_protocol = htons(protocol);
-	/* Index of the network device */
-	sockaddr.sll_ifindex = if_idx.ifr_ifindex;
 
-	if (bind(sockfd, (struct sockaddr*) &sockaddr, sizeof(sockaddr))) {
+	if (bind(sockfd, (struct sockaddr *) &sockaddr, sizeof(sockaddr))) {
 		perror("bind");
 		return -1;
 	}
@@ -260,9 +259,10 @@ int main(int argc, char *argv[])
 {
 	int sockfd;
 	int c;
-	const char *lflag = NULL;
-	char src_mac[50], dst_mac[50];
-	int tflag = 0;
+	char src_iface[IFNAMSIZ] = {0},
+	     dst_addr[IFNAMSIZ] = {0},
+	     listen_iface[IFNAMSIZ] = {0};
+	int ethertype = 0;
 	static struct option long_options[] = {
 		{"listen",        required_argument, 0, 'l'},
 		{"source",        required_argument, 0, 's'},
@@ -277,6 +277,7 @@ int main(int argc, char *argv[])
 		usage();
 		return -1;
 	}
+
 	for (;;) {
 		c = getopt_long(argc, argv, "hs:d:t:l:",
 			long_options, NULL);
@@ -286,16 +287,16 @@ int main(int argc, char *argv[])
 
 		switch (c) {
 		case 'l':
-			lflag = optarg;
+			strncpy(listen_iface, optarg, sizeof(listen_iface));
 			break;
 		case 'd':
-			strcpy(dst_mac, optarg);
+			strncpy(dst_addr, optarg, sizeof(dst_addr));
 			break;
 		case 's':
-			strcpy(src_mac, optarg);
+			strncpy(src_iface, optarg, sizeof(src_iface));
 			break;
 		case 't':
-			tflag = atoi(optarg);
+			ethertype = atoi(optarg);
 			break;
 		case 'h':
 			usage();
@@ -311,26 +312,32 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-	if (lflag) {
-		fprintf(stderr, "in listen mode\n");
+	if (!ethertype)
+		ethertype = ETH_P_IP;
 
-		rawbind(sockfd, lflag, tflag);
-		rwloop(sockfd, lflag, NULL, tflag);
+	if (*listen_iface) {
+		fprintf(stderr, "listening on %s\n", listen_iface);
+
+		if (rawbind(sockfd, listen_iface, ethertype)) {
+			fprintf(stderr, "rawbind: could not bind to %s\n",
+			        listen_iface);
+		}
+		rwloop(sockfd, NULL, NULL, -1);
 		return 0;
 	}
 
-	if (!strlen(src_mac)) {
+	if (!*src_iface) {
 		fprintf(stderr, "no source interface specified\n");
 		return -1;
 	}
 
-	if (!strlen(dst_mac)) {
+	if (!*dst_addr) {
 		fprintf(stderr, "no destination address specified\n");
 		return -1;
 	}
 
-	fprintf(stderr, "in write mode\n");
-	rwloop(sockfd, src_mac, dst_mac, tflag);
+	fprintf(stderr, "src: %s, dst: %s\n", &src_iface[0], &dst_addr[0]);
+	rwloop(sockfd, &src_iface[0], &dst_addr[0], ethertype);
 
 	return 0;
 }
