@@ -43,7 +43,6 @@ char bcastmac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 int make_srcaddr(int sockfd, const char *ifname, struct sockaddr_ll *dest_out);
 int make_lladdr(const char *mac, struct sockaddr_ll *dest_out);
-int Tflag = ETH_P_IP;
 
 void print_addr(unsigned char mac[6])
 {
@@ -64,7 +63,7 @@ int split_hwaddr(const char *macstr, unsigned char hwaddr[6]);
 int get_iface_hwaddr(int sockfd, const char *iface, unsigned char hwaddr[6]);
 int get_iface_index(int sockfd, const char *iface, int *index);
 
-void rwloop(int sockfd, const char *ifname, const char *dest_mac)
+void rwloop(int sockfd, const char *ifname, const char *dest_mac, unsigned short proto)
 {
 	char buf[1024];
 	int nread_stdin, nread_netfd, nwritten;
@@ -78,6 +77,7 @@ void rwloop(int sockfd, const char *ifname, const char *dest_mac)
 		.tv_usec = 0
 	};
 	struct timeval timeout;
+	struct my_packet pkt;
 
 	FD_ZERO(&master_readfds);
 	FD_ZERO(&readfds);
@@ -96,10 +96,8 @@ void rwloop(int sockfd, const char *ifname, const char *dest_mac)
 		return;
 
 	src.sll_family = AF_PACKET;
-	src.sll_protocol = htons(Tflag);
+	src.sll_protocol = htons(proto);
 	src.sll_halen = ETH_ALEN;
-
-	struct my_packet pkt;
 
 	/* Destination may be either an interface name or a hw address. */
 	if (split_hwaddr(dest_mac, pkt.hdr.ether_dhost) &&
@@ -107,7 +105,7 @@ void rwloop(int sockfd, const char *ifname, const char *dest_mac)
 		return;
 
 	memcpy(pkt.hdr.ether_shost, src.sll_addr,  sizeof(pkt.hdr.ether_shost));
-	pkt.hdr.ether_type = htons(src.sll_protocol);
+	pkt.hdr.ether_type = htons(proto);
 
 	fprintf(stderr, "Src: "); print_addr(src.sll_addr);
 	fprintf(stderr, "Dst: "); print_addr(pkt.hdr.ether_dhost);
@@ -123,7 +121,7 @@ void rwloop(int sockfd, const char *ifname, const char *dest_mac)
 		}
 
 		if (!nready) {
-			fprintf(stderr, "Timeout reached.\n");
+			fprintf(stderr, "select: timeout reached.\n");
 			return;
 		}
 
@@ -298,7 +296,6 @@ int main(int argc, char *argv[])
 			break;
 		case 't':
 			tflag = atoi(optarg);
-			Tflag = tflag;
 			break;
 		case 'h':
 			usage();
@@ -318,7 +315,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "in listen mode\n");
 
 		rawbind(sockfd, lflag, tflag);
-		rwloop(sockfd, lflag, NULL);
+		rwloop(sockfd, lflag, NULL, tflag);
 		return 0;
 	}
 
@@ -333,7 +330,7 @@ int main(int argc, char *argv[])
 	}
 
 	fprintf(stderr, "in write mode\n");
-	rwloop(sockfd, src_mac, dst_mac);
+	rwloop(sockfd, src_mac, dst_mac, tflag);
 
 	return 0;
 }
