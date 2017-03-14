@@ -133,8 +133,7 @@ void rwloop(int sockfd, const char *src, const char *dst, unsigned short proto)
 			/* STDIN_FILENO gone */
 			if (!nread_stdin) {
 				fprintf(stderr, "stdin is gone\n");
-				FD_CLR(STDIN_FILENO, &master_readfds);
-				continue;
+				break;
 			}
 
 			fprintf(stderr, "stdin: %db in\n", nread_stdin);
