@@ -44,8 +44,8 @@ char bcastmac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 int make_srcaddr(int sockfd, const char *ifname, struct sockaddr_ll *dest_out);
 int make_lladdr(const char *mac, struct sockaddr_ll *dest_out);
 int Tflag = ETH_P_IP;
-void print_addr(struct sockaddr_ll *dest);
-void print_addr_str(unsigned char mac[6])
+
+void print_addr(unsigned char mac[6])
 {
 	fprintf(stderr, "%2x:%2x:%2x:%2x:%2x:%2x\n", mac[0],
 		mac[1],
@@ -60,12 +60,15 @@ struct my_packet {
 	unsigned char data[ETHERMTU - sizeof(struct ether_header)];
 };
 
+int split_hwaddr(const char *macstr, unsigned char hwaddr[6]);
+int get_iface_hwaddr(int sockfd, const char *iface, unsigned char hwaddr[6]);
+int get_iface_index(int sockfd, const char *iface, int *index);
+
 void rwloop(int sockfd, const char *ifname, const char *dest_mac)
 {
 	char buf[1024];
 	int nread_stdin, nread_netfd, nwritten;
 	struct sockaddr_ll src;
-	struct sockaddr_ll dest;
 	struct sockaddr_ll client;
 	socklen_t clientsz;
 	fd_set master_readfds, readfds, writefds;
@@ -83,16 +86,31 @@ void rwloop(int sockfd, const char *ifname, const char *dest_mac)
 	FD_SET(STDIN_FILENO, &master_readfds);
 	FD_SET(sockfd, &master_readfds);
 
-	make_srcaddr(sockfd, ifname, &src);
-	make_lladdr(dest_mac, &dest);
+	/* Setup a source struct sockaddr_ll */
+	memset(&src, 0, sizeof(src));
+	/* Only interface name must be passed. */
+	if (get_iface_hwaddr(sockfd, ifname, src.sll_addr))
+		return;
+
+	if (get_iface_index(sockfd, ifname, &src.sll_ifindex))
+		return;
+
+	src.sll_family = AF_PACKET;
+	src.sll_protocol = htons(Tflag);
+	src.sll_halen = ETH_ALEN;
 
 	struct my_packet pkt;
-	memcpy(pkt.hdr.ether_dhost, dest.sll_addr, sizeof(pkt.hdr.ether_dhost));
-	memcpy(pkt.hdr.ether_shost, src.sll_addr,  sizeof(pkt.hdr.ether_shost));
-	pkt.hdr.ether_type = htons(Tflag);
 
-	fprintf(stderr, "Src: "); print_addr(&src);
-	fprintf(stderr, "Dst: "); print_addr(&dest);
+	/* Destination may be either an interface name or a hw address. */
+	if (split_hwaddr(dest_mac, pkt.hdr.ether_dhost) &&
+	    get_iface_hwaddr(sockfd, dest_mac, pkt.hdr.ether_dhost))
+		return;
+
+	memcpy(pkt.hdr.ether_shost, src.sll_addr,  sizeof(pkt.hdr.ether_shost));
+	pkt.hdr.ether_type = htons(src.sll_protocol);
+
+	fprintf(stderr, "Src: "); print_addr(src.sll_addr);
+	fprintf(stderr, "Dst: "); print_addr(pkt.hdr.ether_dhost);
 
 	for (;;) {
 		readfds = master_readfds;
@@ -161,80 +179,50 @@ void rwloop(int sockfd, const char *ifname, const char *dest_mac)
 	}
 }
 
-void print_addr(struct sockaddr_ll *dest)
+int get_iface_hwaddr(int sockfd, const char *iface, unsigned char hwaddr[6])
 {
-	fprintf(stderr, "%2x:%2x:%2x:%2x:%2x:%2x\n", dest->sll_addr[0],
-		dest->sll_addr[1],
-		dest->sll_addr[2],
-		dest->sll_addr[3],
-		dest->sll_addr[4],
-		dest->sll_addr[5]);
-}
+	struct ifreq if_mac;
 
-int make_lladdr(const char *mac, struct sockaddr_ll *dest_out)
-{
-	struct sockaddr_ll dest;
-
-	if (!mac)
-		return -1;
-
-	sscanf(mac, "%2x:%2x:%2x:%2x:%2x:%2x",
-		(unsigned int *)&dest.sll_addr[0],
-		(unsigned int *)&dest.sll_addr[1],
-		(unsigned int *)&dest.sll_addr[2],
-		(unsigned int *)&dest.sll_addr[3],
-		(unsigned int *)&dest.sll_addr[4],
-		(unsigned int *)&dest.sll_addr[5]);
-
-	if (dest_out)
-		*dest_out = dest;
-
-	return 0;
-}
-
-int make_srcaddr(int sockfd, const char *ifname, struct sockaddr_ll *dest_out)
-{
-	struct ifreq if_mac, if_idx;
-	struct sockaddr_ll dest;
-
-	/* Get the MAC address of the interface to send on */
-	memset(&if_mac, 0, sizeof(struct ifreq));
-	strncpy(if_mac.ifr_name, ifname, strlen(ifname));
+	memset(&if_mac, 0, sizeof(if_mac));
+	strncpy(if_mac.ifr_name, iface, IFNAMSIZ-1);
 	if (ioctl(sockfd, SIOCGIFHWADDR, &if_mac) < 0) {
-		perror("SIOCGIFHWADDR");
+		perror("ioctl: SIOCGIFHWADDR");
 		return -1;
 	}
 
-	/* Get the index of the interface to send on */
-	memset(&if_idx, 0, sizeof(struct ifreq));
-	strncpy(if_idx.ifr_name, ifname, IFNAMSIZ-1);
-	if (ioctl(sockfd, SIOCGIFINDEX, &if_idx) < 0) {
-		perror("SIOCGIFINDEX");
-		return -1;
-	}
-
-	memset(&dest, 0, sizeof(dest));
-	dest.sll_family = AF_PACKET;
-	dest.sll_protocol = htons(Tflag);
-	/* Index of the network device */
-	dest.sll_ifindex = if_idx.ifr_ifindex;
-	/* Address length*/
-	dest.sll_halen = ETH_ALEN;
-	/* Destination MAC */
-	dest.sll_addr[0] = ((uint8_t *)&if_mac.ifr_hwaddr.sa_data)[0];
-	dest.sll_addr[1] = ((uint8_t *)&if_mac.ifr_hwaddr.sa_data)[1];
-	dest.sll_addr[2] = ((uint8_t *)&if_mac.ifr_hwaddr.sa_data)[2];
-	dest.sll_addr[3] = ((uint8_t *)&if_mac.ifr_hwaddr.sa_data)[3];
-	dest.sll_addr[4] = ((uint8_t *)&if_mac.ifr_hwaddr.sa_data)[4];
-	dest.sll_addr[5] = ((uint8_t *)&if_mac.ifr_hwaddr.sa_data)[5];
-
-	if (dest_out)
-		*dest_out = dest;
+	memcpy(hwaddr, if_mac.ifr_hwaddr.sa_data, 6);
 
 	return 0;
 }
 
-int rawbind(int sockfd, const char *ifname)
+int get_iface_index(int sockfd, const char *iface, int *index)
+{
+	struct ifreq if_idx;
+
+	memset(&if_idx, 0, sizeof(if_idx));
+	strncpy(if_idx.ifr_name, iface, IFNAMSIZ-1);
+	if (ioctl(sockfd, SIOCGIFINDEX, &if_idx) < 0) {
+		perror("ioctl: SIOCGIFINDEX");
+		return -1;
+	}
+
+	*index = if_idx.ifr_ifindex;
+
+	return 0;
+}
+
+int split_hwaddr(const char *macstr, unsigned char hwaddr[6])
+{
+	/* hh for a pointer to a signed char or unsigned char */
+	if (sscanf(macstr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+	    &hwaddr[0], &hwaddr[1], &hwaddr[2], &hwaddr[3],
+	    &hwaddr[4], &hwaddr[5]) != 6)
+		return -1;
+
+	return 0;
+}
+
+int rawbind(int sockfd, const char *ifname, unsigned short protocol)
 {
 	struct ifreq if_idx;
 	struct sockaddr_ll sockaddr;
@@ -250,7 +238,7 @@ int rawbind(int sockfd, const char *ifname)
 
 	memset(&sockaddr, 0, sizeof(sockaddr));
 	sockaddr.sll_family = AF_PACKET;
-	sockaddr.sll_protocol = htons(Tflag);
+	sockaddr.sll_protocol = htons(protocol);
 	/* Index of the network device */
 	sockaddr.sll_ifindex = if_idx.ifr_ifindex;
 
@@ -329,7 +317,7 @@ int main(int argc, char *argv[])
 	if (lflag) {
 		fprintf(stderr, "in listen mode\n");
 
-		rawbind(sockfd, lflag);
+		rawbind(sockfd, lflag, tflag);
 		rwloop(sockfd, lflag, NULL);
 		return 0;
 	}
