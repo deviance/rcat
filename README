@@ -1,0 +1,19 @@
+rcat - concatenate raw sockets
+
+rcat operates in one of two primary modes: connect mode and listen mode.
+
+In connect mode, the *source* and *destination* arguments tell which
+addresses to connect. Both arguments are required; source must be an
+interface name (e.g. 'eth0'), but destination may be an adapter name or
+a hardware address ('ff:ff:ff:ff:ff:ff' for broadcast).
+
+In listen mode, specify an interface name to the *listen* option.
+
+A simple data transfer. In one terminal emulator run (requires root
+privileges):
+
+	# rcat -l eth1 > data.out
+
+Send data from another terminal:
+
+	# rcat -s eth0 -d eth1 < data
