@@ -1,2 +1,2 @@
 all:
-	gcc -Wall -Wextra -o rcat rcat.c
+	gcc -std=gnu99 -Wall -Wextra -Wpedantic -o rcat rcat.c

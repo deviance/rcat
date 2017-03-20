@@ -47,15 +47,18 @@ struct my_packet {
 int split_hwaddr(const char *macstr, unsigned char hwaddr[6]);
 int get_iface_hwaddr(int sockfd, const char *iface, unsigned char hwaddr[6]);
 int get_iface_index(int sockfd, const char *iface, int *index);
-void print_addr(unsigned char mac[6]);
+void print_addr(const unsigned char mac[6]);
+int sockaddr_for_iface(int sockfd, const char *iface, unsigned short proto, struct sockaddr_ll *sllout);
+int make_ethheader(struct ether_header *hdr, const struct sockaddr_ll *src,
+                   const struct sockaddr_ll *dst);
 
-void rwloop(int sockfd, const char *src, const char *dst, unsigned short proto)
+void rwloop(int sockfd, const struct sockaddr_ll *src, const struct sockaddr_ll *dst)
 {
-	char buf[ETHERMTU];
+	unsigned char stdinbuf[ETHERMTU], netinbuf[ETHERMTU];
 	int nread_stdin,
 	    nread_netfd,
-	    nwritten;
-	struct sockaddr_ll sll_src;
+	    nsent_stdout,
+	    nsent_netfd;
 	struct sockaddr_ll sll_client;
 	socklen_t clientsz;
 	fd_set master_readfds,
@@ -67,7 +70,6 @@ void rwloop(int sockfd, const char *src, const char *dst, unsigned short proto)
 		.tv_usec = 0
 	};
 	struct timeval timeout;
-	struct my_packet pkt;
 
 	FD_ZERO(&master_readfds);
 	FD_ZERO(&readfds);
@@ -75,38 +77,6 @@ void rwloop(int sockfd, const char *src, const char *dst, unsigned short proto)
 
 	FD_SET(STDIN_FILENO, &master_readfds);
 	FD_SET(sockfd, &master_readfds);
-
-	if (src) {
-		/* Setup a source struct sockaddr_ll */
-		memset(&sll_src, 0, sizeof(sll_src));
-		/* Only interface name must be passed. */
-		if (get_iface_hwaddr(sockfd, src, sll_src.sll_addr))
-			return;
-
-		fprintf(stderr, "%s hwaddr is ", src); print_addr(sll_src.sll_addr);
-
-		if (get_iface_index(sockfd, src, &sll_src.sll_ifindex))
-			return;
-
-		fprintf(stderr, "%s index is %d\n", src, sll_src.sll_ifindex);
-
-		sll_src.sll_family = AF_PACKET;
-		sll_src.sll_protocol = htons(proto);
-		sll_src.sll_halen = ETH_ALEN;
-		memcpy(pkt.hdr.ether_shost, sll_src.sll_addr, sizeof(pkt.hdr.ether_shost));
-	}
-
-	if (dst) {
-		/* Destination may be either an interface name or a hw address. */
-		if (split_hwaddr(dst, pkt.hdr.ether_dhost) &&
-		    get_iface_hwaddr(sockfd, dst, pkt.hdr.ether_dhost))
-			return;
-
-		fprintf(stderr, "%s hwaddr is ", dst); print_addr(pkt.hdr.ether_dhost);
-	}
-
-	if (proto >= 0)
-		pkt.hdr.ether_type = htons(proto);
 
 	for (;;) {
 		readfds = master_readfds;
@@ -123,55 +93,141 @@ void rwloop(int sockfd, const char *src, const char *dst, unsigned short proto)
 			return;
 		}
 
-		fprintf(stderr, "%d ready\n", nready);
+		/* Stdin is gone */
+		if (!FD_ISSET(STDIN_FILENO, &master_readfds)) {
+			fprintf(stderr, "stdin is gone\n");
+			break;
+		}
+
+		/* Try read from stdin */
 		if (FD_ISSET(STDIN_FILENO, &readfds)) {
-			nread_stdin = read(STDIN_FILENO, pkt.data, sizeof(pkt.data));
+
+			memset(stdinbuf, 0, sizeof(stdinbuf));
+			nread_stdin = read(STDIN_FILENO, stdinbuf, ETHERMTU);
 			if (nread_stdin < 0) {
 				perror("read: STDIN");
 				break;
 			}
-			/* STDIN_FILENO gone */
+
 			if (!nread_stdin) {
-				fprintf(stderr, "stdin is gone\n");
-				break;
+				FD_CLR(STDIN_FILENO, &master_readfds);
+				continue;
 			}
 
 			fprintf(stderr, "stdin: %db in\n", nread_stdin);
 			FD_SET(sockfd, &writefds);
 		}
 
+		/* Try read from socket */
 		if (FD_ISSET(sockfd, &readfds)) {
-			nread_netfd = recvfrom(sockfd, buf, sizeof(buf), 0,
+
+			memset(netinbuf, 0, sizeof(netinbuf));
+			nread_netfd = recvfrom(sockfd, netinbuf, ETHERMTU, 0,
 				(struct sockaddr *) &sll_client, &clientsz);
+
 			if (nread_netfd < 0) {
 				perror("recvfrom: sockfd");
 				break;
 			}
-			fprintf(stderr, "sockfd: %db in\n", nread_netfd);
+
+			fprintf(stderr, "from: ");
+			print_addr(sll_client.sll_addr);
+			fprintf(stderr, "sockfd: %db\n", nread_netfd);
 			FD_SET(STDOUT_FILENO, &writefds);
 		}
 
+		/* Try write to stdout */
 		if (FD_ISSET(STDOUT_FILENO, &writefds)) {
-			nwritten = write(STDOUT_FILENO, buf, nread_netfd);
-			if (nwritten < 0) {
+
+			const struct my_packet *p = (const struct my_packet *) netinbuf;
+
+			nsent_stdout = write(STDOUT_FILENO, p->data, nread_netfd -
+			                 sizeof(p->hdr));
+
+			if (nsent_stdout < 0) {
 				perror("write: STDOUT");
 				break;
 			}
-			fprintf(stderr, "stdout: %db out\n", nwritten);
+
+			fprintf(stderr, "stdout: %db out\n", nsent_stdout);
 			FD_CLR(STDOUT_FILENO, &writefds);
 		}
 
+		/* Try write to socket */
 		if (FD_ISSET(sockfd, &writefds)) {
-			nwritten = sendto(sockfd, &pkt, sizeof(pkt.hdr) + nread_stdin, 0,
-				(struct sockaddr *) &sll_src, sizeof(sll_src));
-			if (nwritten < 0) {
+
+			struct my_packet p;
+
+			if (make_ethheader(&p.hdr, src, dst) < 0) {
+				fprintf(stderr, "make_ethheader: error\n");
+				return;
+			}
+
+			memcpy(p.data, stdinbuf, nread_stdin);
+
+			nsent_netfd = sendto(sockfd, &p,
+					  nread_stdin + sizeof(p.hdr), 0,
+					  (struct sockaddr *) src,
+					  sizeof(*src));
+
+			if (nsent_netfd < 0) {
 				perror("sendto: sockfd");
 				break;
 			}
-			fprintf(stderr, "sockfd: %db out\n", nwritten);
+
+			fprintf(stderr, "sockfd: %db out\n", nsent_netfd);
 			FD_CLR(sockfd, &writefds);
 		}
 	}
+
+}
+/*
+ * The sockaddr_ll structure is a device-independent physical-layer
+ * address.
+ *
+ *     struct sockaddr_ll {
+ *         unsigned short sll_family;   // Always AF_PACKET
+ *         unsigned short sll_protocol; // Physical-layer protocol
+ *         int            sll_ifindex;  // Interface number
+ *         unsigned short sll_hatype;   // ARP hardware type
+ *         unsigned char  sll_pkttype;  // Packet type
+ *         unsigned char  sll_halen;    // Length of address
+ *         unsigned char  sll_addr[8];  // Physical-layer address
+ *     };
+ *
+ *     When you send packets, it is enough to specify sll_family, sll_addr,
+ *     sll_halen, sll_ifindex, and sll_protocol.  The other fields should be
+ *     0.  sll_hatype and sll_pkttype are set on received packets for your
+ *     information.
+ */
+
+int sockaddr_for_iface(int sockfd, const char *iface, unsigned short proto, struct sockaddr_ll *sllout)
+{
+	struct sockaddr_ll sll;
+
+	memset(&sll, 0, sizeof(sll));
+
+	sll.sll_family = AF_PACKET;
+	sll.sll_protocol = htons(proto);
+	sll.sll_halen = ETH_ALEN;
+	sll.sll_ifindex = -1;
+
+	if (!iface)
+		goto out;
+
+	/* Something not 'eth0' or 'aa:bb:cc:dd:ee:ff' was passed */
+	if ((split_hwaddr(iface, sll.sll_addr) < 0) &&
+	    (get_iface_hwaddr(sockfd, iface, sll.sll_addr) < 0))
+		return -1;
+
+	/* It was an interface name, but could not get index */
+	if ((split_hwaddr(iface, sll.sll_addr) < 0) &&
+	    (get_iface_index(sockfd, iface, &sll.sll_ifindex) < 0))
+		return -2;
+
+out:
+	*sllout = sll;
+	return 0;
 }
 
 int get_iface_hwaddr(int sockfd, const char *iface, unsigned char hwaddr[6])
@@ -193,9 +249,9 @@ int get_iface_hwaddr(int sockfd, const char *iface, unsigned char hwaddr[6])
 	return 0;
 }
 
-void print_addr(unsigned char mac[6])
+void print_addr(const unsigned char mac[6])
 {
-	fprintf(stderr, "%2x:%2x:%2x:%2x:%2x:%2x\n", mac[0], mac[1],
+	fprintf(stderr, "%02x:%02x:%02x:%02x:%02x:%02x\n", mac[0], mac[1],
 	        mac[2], mac[3], mac[4], mac[5]);
 }
 
@@ -226,42 +282,48 @@ int split_hwaddr(const char *macstr, unsigned char hwaddr[6])
 	return 0;
 }
 
-int rawbind(int sockfd, const char *ifname, unsigned short protocol)
+int make_ethheader(struct ether_header *hdr, const struct sockaddr_ll *src,
+                   const struct sockaddr_ll *dst)
 {
-	struct sockaddr_ll sockaddr;
-
-	/* Get the index of the interface to send on */
-	if (get_iface_index(sockfd, ifname, &sockaddr.sll_ifindex))
+	if (!hdr || !src)
 		return -1;
 
-	memset(&sockaddr, 0, sizeof(sockaddr));
-	sockaddr.sll_family = AF_PACKET;
-	sockaddr.sll_protocol = htons(protocol);
+	memset(hdr, 0, sizeof(*hdr));
 
-	if (bind(sockfd, (struct sockaddr *) &sockaddr, sizeof(sockaddr))) {
-		perror("bind");
-		return -1;
-	}
+	hdr->ether_type = src->sll_protocol;
+	memcpy(hdr->ether_shost, src->sll_addr, sizeof(hdr->ether_shost));
+
+	if (dst)
+		memcpy(hdr->ether_dhost, dst->sll_addr, sizeof(hdr->ether_dhost));
 
 	return 0;
 }
 
 void usage() {
 	const char usage_str[] = {
-		"usage: rcat [--ethertype type] [--source iface] [--destination iface] [--listen iface]"
+		"usage: rcat [--ethertype type] [--source iface]\n"
+		"            [--destination iface] [--listen iface] [--help]"
 	};
 
 	printf("%s\n", usage_str);
 }
 
+const char warn_root_banner[] = {
+	"@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+	"@@@@@@@@@@@@@@@@@@@@@@ RUNNING WITH ROOT PRIVILEGES !!! @@@@@@@@@@@@@@@@@@@@@@@\n"
+	"@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+};
+
 int main(int argc, char *argv[])
 {
 	int sockfd;
 	int c;
-	char src_iface[IFNAMSIZ] = {0},
-	     dst_addr[IFNAMSIZ] = {0},
-	     listen_iface[IFNAMSIZ] = {0};
+	char src_iface[IFNAMSIZ + 1] = {0},
+	     dst_addr[IFNAMSIZ + 1] = {0},
+	     listen_iface[IFNAMSIZ + 1] = {0};
 	int ethertype = 0;
+	struct sockaddr_ll sll_src, sll_dst;
+	int mconnect;
 	static struct option long_options[] = {
 		{"listen",        required_argument, 0, 'l'},
 		{"source",        required_argument, 0, 's'},
@@ -276,6 +338,9 @@ int main(int argc, char *argv[])
 		usage();
 		return -1;
 	}
+
+	if (!getuid())
+		fprintf(stderr, warn_root_banner);
 
 	for (;;) {
 		c = getopt_long(argc, argv, "hs:d:t:l:",
@@ -305,23 +370,33 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	if (!ethertype)
+		ethertype = ETH_P_IP;
+
+	mconnect = (*src_iface && *dst_addr);
+
 	/* Open RAW socket to send on */
 	if ((sockfd = socket(AF_PACKET, SOCK_RAW, IPPROTO_RAW)) == -1) {
 		perror("socket");
 		return -1;
 	}
 
-	if (!ethertype)
-		ethertype = ETH_P_IP;
+	if (!mconnect && *listen_iface) {
 
-	if (*listen_iface) {
 		fprintf(stderr, "listening on %s\n", listen_iface);
 
-		if (rawbind(sockfd, listen_iface, ethertype)) {
-			fprintf(stderr, "rawbind: could not bind to %s\n",
-			        listen_iface);
+		if (sockaddr_for_iface(sockfd, listen_iface,
+		                       ethertype, &sll_src)) {
+			fprintf(stderr, "sockaddr_for_iface: error\n");
+			return -1;
 		}
-		rwloop(sockfd, NULL, NULL, -1);
+
+		if (bind(sockfd, (struct sockaddr *) &sll_src, sizeof(sll_src))) {
+			perror("bind");
+			return -1;
+		}
+
+		rwloop(sockfd, &sll_src, NULL);
 		return 0;
 	}
 
@@ -335,8 +410,24 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
+	if (sockaddr_for_iface(sockfd, src_iface,
+			       ethertype, &sll_src)) {
+		fprintf(stderr, "sockaddr_for_iface: src: error\n");
+		return -1;
+	}
+
+	if (sockaddr_for_iface(sockfd, dst_addr,
+			       ethertype, &sll_dst)) {
+		fprintf(stderr, "sockaddr_for_iface: dst: error\n");
+		return -1;
+	}
+	/*
 	fprintf(stderr, "src: %s, dst: %s\n", &src_iface[0], &dst_addr[0]);
-	rwloop(sockfd, &src_iface[0], &dst_addr[0], ethertype);
+	print_addr(sll_src.sll_addr);
+	printf("%d\n", sll_src.sll_ifindex);
+	print_addr(sll_dst.sll_addr);
+	printf("%d\n", sll_dst.sll_ifindex); */
+	rwloop(sockfd, &sll_src, &sll_dst);
 
 	return 0;
 }
