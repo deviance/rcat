@@ -38,6 +38,10 @@
 #include <getopt.h>
 #include <sys/select.h>
 #include <linux/if_vlan.h>
+#include <time.h>
+#include <sys/time.h>
+
+static int verbose = 1;
 
 struct my_packet {
 	struct ether_header hdr;
@@ -47,10 +51,10 @@ struct my_packet {
 int split_hwaddr(const char *macstr, unsigned char hwaddr[6]);
 int get_iface_hwaddr(int sockfd, const char *iface, unsigned char hwaddr[6]);
 int get_iface_index(int sockfd, const char *iface, int *index);
-void print_addr(const unsigned char mac[6]);
 int sockaddr_for_iface(int sockfd, const char *iface, unsigned short proto, struct sockaddr_ll *sllout);
 int make_ethheader(struct ether_header *hdr, const struct sockaddr_ll *src,
                    const struct sockaddr_ll *dst);
+char *prettymac(const unsigned char mac[6], char macout[IFNAMSIZ + 1]);
 
 void rwloop(int sockfd, const struct sockaddr_ll *src, const struct sockaddr_ll *dst)
 {
@@ -114,7 +118,6 @@ void rwloop(int sockfd, const struct sockaddr_ll *src, const struct sockaddr_ll 
 				continue;
 			}
 
-			fprintf(stderr, "stdin: %db in\n", nread_stdin);
 			FD_SET(sockfd, &writefds);
 		}
 
@@ -130,9 +133,20 @@ void rwloop(int sockfd, const struct sockaddr_ll *src, const struct sockaddr_ll 
 				break;
 			}
 
-			fprintf(stderr, "from: ");
-			print_addr(sll_client.sll_addr);
-			fprintf(stderr, "sockfd: %db\n", nread_netfd);
+			if (verbose) {
+				char mac1[IFNAMSIZ + 1], mac2[IFNAMSIZ + 1];
+				struct timeval tv;
+
+				gettimeofday(&tv, NULL);
+
+				fprintf(stderr, "%lu.%06lu %s > %s, ethertype 0x%x, length %i\n",
+				        tv.tv_sec, tv.tv_usec,
+				        prettymac(sll_client.sll_addr, mac1),
+				        prettymac(src->sll_addr, mac2),
+				        ntohs(src->sll_protocol),
+				        nread_netfd);
+			}
+
 			FD_SET(STDOUT_FILENO, &writefds);
 		}
 
@@ -149,7 +163,6 @@ void rwloop(int sockfd, const struct sockaddr_ll *src, const struct sockaddr_ll 
 				break;
 			}
 
-			fprintf(stderr, "stdout: %db out\n", nsent_stdout);
 			FD_CLR(STDOUT_FILENO, &writefds);
 		}
 
@@ -175,12 +188,26 @@ void rwloop(int sockfd, const struct sockaddr_ll *src, const struct sockaddr_ll 
 				break;
 			}
 
-			fprintf(stderr, "sockfd: %db out\n", nsent_netfd);
+			if (verbose) {
+				char mac1[IFNAMSIZ + 1], mac2[IFNAMSIZ + 1];
+				struct timeval tv;
+
+				gettimeofday(&tv, NULL);
+
+				fprintf(stderr, "%lu.%06lu %s > %s, ethertype 0x%x, length %i\n",
+				        tv.tv_sec, tv.tv_usec,
+				        prettymac(src->sll_addr, mac1),
+				        prettymac(dst->sll_addr, mac2),
+				        ntohs(src->sll_protocol),
+				        nsent_netfd);
+			}
+
 			FD_CLR(sockfd, &writefds);
 		}
 	}
 
 }
+
 /*
  * The sockaddr_ll structure is a device-independent physical-layer
  * address.
@@ -249,10 +276,14 @@ int get_iface_hwaddr(int sockfd, const char *iface, unsigned char hwaddr[6])
 	return 0;
 }
 
-void print_addr(const unsigned char mac[6])
+char *prettymac(const unsigned char mac[6], char macout[IFNAMSIZ + 1])
 {
-	fprintf(stderr, "%02x:%02x:%02x:%02x:%02x:%02x\n", mac[0], mac[1],
-	        mac[2], mac[3], mac[4], mac[5]);
+	sprintf(macout, "%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx",
+	        mac[0], mac[1],
+	        mac[2], mac[3],
+	        mac[4], mac[5]);
+
+	return macout;
 }
 
 int get_iface_index(int sockfd, const char *iface, int *index)
@@ -302,16 +333,17 @@ int make_ethheader(struct ether_header *hdr, const struct sockaddr_ll *src,
 void usage() {
 	const char usage_str[] = {
 		"usage: rcat [--ethertype type] [--source iface]\n"
-		"            [--destination iface] [--listen iface] [--help]"
+		"            [--destination iface] [--listen iface] [--help]\n"
+		"            [--verbose]"
 	};
 
 	printf("%s\n", usage_str);
 }
 
 const char warn_root_banner[] = {
-	"@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
-	"@@@@@@@@@@@@@@@@@@@@@@ RUNNING WITH ROOT PRIVILEGES !!! @@@@@@@@@@@@@@@@@@@@@@@\n"
-	"@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+	"@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+	"@ RUNNING WITH ROOT PRIVILEGES !!! @\n"
+	"@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
 };
 
 int main(int argc, char *argv[])
@@ -330,6 +362,7 @@ int main(int argc, char *argv[])
 		{"destination",   required_argument, 0, 'd'},
 		{"ethertype",     required_argument, 0, 't'},
 		{"help",          no_argument,       0, 'h'},
+		{"verbose",       no_argument,       0, 'v'},
 		{0,               0,                 0,  0 }
 	};
 
@@ -343,7 +376,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr, warn_root_banner);
 
 	for (;;) {
-		c = getopt_long(argc, argv, "hs:d:t:l:",
+		c = getopt_long(argc, argv, "hvs:d:t:l:",
 			long_options, NULL);
 
 		if (c == -1)
@@ -361,6 +394,9 @@ int main(int argc, char *argv[])
 			break;
 		case 't':
 			ethertype = atoi(optarg);
+			break;
+		case 'v':
+			verbose = 1;
 			break;
 		case 'h':
 			usage();
@@ -383,8 +419,6 @@ int main(int argc, char *argv[])
 
 	if (!mconnect && *listen_iface) {
 
-		fprintf(stderr, "listening on %s\n", listen_iface);
-
 		if (sockaddr_for_iface(sockfd, listen_iface,
 		                       ethertype, &sll_src)) {
 			fprintf(stderr, "sockaddr_for_iface: error\n");
@@ -395,6 +429,9 @@ int main(int argc, char *argv[])
 			perror("bind");
 			return -1;
 		}
+
+		if (verbose)
+			fprintf(stderr, "listening on %s\n", listen_iface);
 
 		rwloop(sockfd, &sll_src, NULL);
 		return 0;
@@ -421,12 +458,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "sockaddr_for_iface: dst: error\n");
 		return -1;
 	}
-	/*
-	fprintf(stderr, "src: %s, dst: %s\n", &src_iface[0], &dst_addr[0]);
-	print_addr(sll_src.sll_addr);
-	printf("%d\n", sll_src.sll_ifindex);
-	print_addr(sll_dst.sll_addr);
-	printf("%d\n", sll_dst.sll_ifindex); */
+
 	rwloop(sockfd, &sll_src, &sll_dst);
 
 	return 0;
