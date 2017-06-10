@@ -232,6 +232,9 @@ int sockaddr_for_iface(int sockfd, const char *iface, unsigned short proto, stru
 {
 	struct sockaddr_ll sll;
 
+	if (!iface || !iface[0] || !sllout)
+		return -1;
+
 	memset(&sll, 0, sizeof(sll));
 
 	sll.sll_family = AF_PACKET;
@@ -239,20 +242,15 @@ int sockaddr_for_iface(int sockfd, const char *iface, unsigned short proto, stru
 	sll.sll_halen = ETH_ALEN;
 	sll.sll_ifindex = -1;
 
-	if (!iface)
-		goto out;
-
 	/* Something not 'eth0' or 'aa:bb:cc:dd:ee:ff' was passed */
 	if ((split_hwaddr(iface, sll.sll_addr) < 0) &&
 	    (get_iface_hwaddr(sockfd, iface, sll.sll_addr) < 0))
 		return -1;
 
-	/* It was an interface name, but could not get index */
-	if ((split_hwaddr(iface, sll.sll_addr) < 0) &&
-	    (get_iface_index(sockfd, iface, &sll.sll_ifindex) < 0))
+	/* Could not get an interface index */
+	if (get_iface_index(sockfd, iface, &sll.sll_ifindex) < 0)
 		return -2;
 
-out:
 	*sllout = sll;
 	return 0;
 }
